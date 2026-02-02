@@ -1,0 +1,19 @@
+# Web Framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart    
+
+# Data Validation
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+
+# AI & Orchestration
+langchain>=0.1.10
+langchain-core>=0.1.25          
+langchain-google-genai>=0.0.9   
+langgraph>=0.0.26               
+
+# Utilities
+python-dotenv>=1.0.1
+regex
+requests
