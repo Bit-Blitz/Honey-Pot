@@ -26,7 +26,7 @@ class AgentState(TypedDict):
 
 # Initialize LLM with built-in retry logic for 429 errors
 llm = ChatGoogleGenerativeAI(
-    model="models/gemini-2.0-flash-001",
+    model="models/gemini-flash-latest",
     google_api_key=settings.GOOGLE_API_KEY,
     temperature=0.7,
     max_retries=5
