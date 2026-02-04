@@ -132,4 +132,46 @@ class HoneyDB:
                 "metadata": f"Detected {len(shared)} shared identifiers linking {len(nodes) - len(shared)} sessions."
             }
 
+    async def get_stats(self):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._get_stats_sync)
+
+    def _get_stats_sync(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            scams_detected = conn.execute("SELECT COUNT(*) FROM sessions WHERE is_scam = 1").fetchone()[0]
+            top_upi = conn.execute("""
+                SELECT value, COUNT(*) as count 
+                FROM extracted_intel 
+                WHERE type = 'upi' 
+                GROUP BY value 
+                ORDER BY count DESC 
+                LIMIT 5
+            """).fetchall()
+            return {
+                "total_sessions": total_sessions,
+                "scams_detected": scams_detected,
+                "top_upi_ids": [r["value"] for r in top_upi]
+            }
+
+    async def get_turn_count(self, session_id: str) -> int:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._get_turn_count_sync, session_id)
+
+    def _get_turn_count_sync(self, session_id: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            if session_id == "all":
+                return conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            return conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0]
+
+    async def is_scam_session(self, session_id: str) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._is_scam_session_sync, session_id)
+
+    def _is_scam_session_sync(self, session_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            res = conn.execute("SELECT is_scam FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            return bool(res[0]) if res else False
+
 db = HoneyDB()

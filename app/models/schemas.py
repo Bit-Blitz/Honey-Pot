@@ -32,6 +32,7 @@ class ExtractedIntel(BaseModel):
 class AgentResponse(BaseModel):
     status: str = "success"
     reply: str
+    metadata: Optional[Dict] = None # Added for syndicate scoring/extra info
 
 class CallbackPayload(BaseModel):
     sessionId: str

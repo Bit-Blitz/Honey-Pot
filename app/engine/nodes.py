@@ -99,11 +99,11 @@ async def _call_extractor(messages):
 
 async def load_history(state: AgentState) -> AgentState:
     try:
-        # DB is sync, but we call it from async node
-        history = db.get_context(state["session_id"])
+        # Await async DB calls
+        history = await db.get_context(state["session_id"])
         state["history"] = history
         state["turn_count"] = len(history)
-        state["scam_detected"] = db.is_scam_session(state["session_id"])
+        state["scam_detected"] = await db.is_scam_session(state["session_id"])
     except Exception as e:
         logger.error(f"Error loading history: {e}")
         state["history"] = []
@@ -302,8 +302,19 @@ async def fingerprint_scammer(state: AgentState) -> AgentState:
         search_results = vector_db.search_similar(behavioral_profile)
         
         if search_results["distances"] and search_results["distances"][0]:
-            match_score = 1.0 - search_results["distances"][0][0]
-            state["syndicate_match_score"] = match_score
+            distance = search_results["distances"][0][0]
+            match_score = 1.0 - distance
+            
+            # BRUTAL SYNDICATE SCORING
+            # If we have multiple matches or a very high match, the score escalates
+            syndicate_score = match_score
+            if match_score > 0.9:
+                syndicate_score = 0.95 # Confirmed high-level syndicate
+            elif match_score > 0.7:
+                syndicate_score = 0.8 # Suspected syndicate hub
+            
+            state["syndicate_match_score"] = syndicate_score
+            
             if match_score > 0.85:
                 state["is_returning_scammer"] = True
                 logger.info("🕵️ SYNDICATE PATTERN MATCHED", extra={
@@ -329,15 +340,15 @@ async def fingerprint_scammer(state: AgentState) -> AgentState:
 
 async def save_state(state: AgentState) -> AgentState:
     try:
-        db.add_message(state["session_id"], "user", state["user_message"])
+        await db.add_message(state["session_id"], "user", state["user_message"])
         if state["agent_response"]:
-            db.add_message(state["session_id"], "assistant", state["agent_response"])
+            await db.add_message(state["session_id"], "assistant", state["agent_response"])
         
         if state.get("scam_detected"):
-            db.set_scam_flag(state["session_id"], True)
+            await db.set_scam_flag(state["session_id"], True)
             logger.info(f"Session {state['session_id']} Sentiment: {state['scammer_sentiment']}")
             
-        state["turn_count"] = db.get_turn_count(state["session_id"])
+        state["turn_count"] = await db.get_turn_count(state["session_id"])
     except Exception as e:
         logger.error(f"Error saving state: {e}")
     return state

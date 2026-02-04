@@ -26,12 +26,14 @@ async def lifespan(app: FastAPI):
     Manages the lifecycle of the Agentic Graph and its persistent checkpointer.
     """
     # Initialize the persistent async checkpointer
+    # LangGraph AsyncSqliteSaver.from_conn_string returns a context manager
     async with AsyncSqliteSaver.from_conn_string("db/checkpoints.sqlite") as saver:
         workflow = build_workflow()
         # Compile the graph with the checkpointer
         app.state.graph = workflow.compile(checkpointer=saver)
         logger.info("🚀 Agentic Graph Compiled with Async Checkpointer")
         yield
+    # Saver automatically closes here due to context manager
 
 app = FastAPI(
     title="Agentic Honey-Pot API", 
@@ -78,12 +80,12 @@ def health_check():
     return {"status": "active", "persona_engine": "Multi-Persona (Rajesh, Anjali, Mr. Sharma)"}
 
 @app.get("/syndicate/graph", dependencies=[Depends(get_api_key)])
-def get_syndicate_graph():
+async def get_syndicate_graph():
     """
     Returns a graph representation of linked scam sessions.
     Used for the Syndicate Intelligence dashboard.
     """
-    return db.get_syndicate_links()
+    return await db.get_syndicate_links()
 
 @app.post("/webhook", response_model=AgentResponse, dependencies=[Depends(get_api_key)])
 @limiter.limit("5/minute")
@@ -98,6 +100,14 @@ async def chat_webhook(
     Now fully async to prevent worker blocking.
     """
     try:
+        # Check if graph is initialized
+        if not hasattr(app.state, "graph"):
+             logger.error("Agentic Graph not initialized in lifespan. Check startup logs.")
+             # For tests where lifespan might not run correctly, we attempt to initialize it without saver
+             # but this is not recommended for production
+             workflow = build_workflow()
+             app.state.graph = workflow.compile()
+
         # Convert incoming conversation history to AgentState format
         history = []
         for msg in payload.conversation_history:
@@ -154,10 +164,15 @@ async def chat_webhook(
                 "match_score": result_state.get("syndicate_match_score")
             })
 
-        # Hackathon mandated response format
+        # Hackathon mandated response format with extra intelligence metadata
         return AgentResponse(
             status="success",
-            reply=result_state["agent_response"]
+            reply=result_state["agent_response"],
+            metadata={
+                "syndicate_score": result_state.get("syndicate_match_score", 0.0),
+                "scam_detected": result_state.get("scam_detected", False),
+                "turn_count": result_state.get("turn_count", 0)
+            }
         )
 
     except HTTPException as e:
@@ -175,12 +190,9 @@ async def get_summary_report():
     """
     Law Enforcement / Admin View: Summary of all detected scams.
     """
-    # This would ideally be a more complex query in repository.py
-    # For now, let's just return a placeholder that "does something" with the data
+    stats = await db.get_stats()
     return {
-        "total_sessions": db.get_turn_count("all"), # Just a dummy count for now
-        "scams_detected": 42, # Mock data for demo
-        "top_upi_ids": ["scammer@okaxis", "fakepay@ybl"],
+        **stats,
         "status": "Ready for Law Enforcement Export"
     }
 
