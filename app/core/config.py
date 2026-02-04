@@ -11,7 +11,34 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Agentic Honey-Pot"
     GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
     API_KEY: str = os.getenv("API_KEY", "helware-secret-key-2024")
-    DATABASE_PATH: str = os.path.join("data", "honey.db")
+    
+    # Hugging Face compatibility: Use /tmp if SPACE_ID is set (HF Spaces)
+    IS_HF: bool = os.getenv("SPACE_ID") is not None
+    BASE_DATA_DIR: str = "/tmp/helware_data" if os.getenv("SPACE_ID") else os.getcwd()
+    
+    @property
+    def DATABASE_PATH(self) -> str:
+        path = os.path.join(self.BASE_DATA_DIR, "data", "honey.db")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    @property
+    def CHECKPOINT_DB_PATH(self) -> str:
+        path = os.path.join(self.BASE_DATA_DIR, "db", "checkpoints.sqlite")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    @property
+    def VECTOR_DB_DIR(self) -> str:
+        path = os.path.join(self.BASE_DATA_DIR, "db", "vector_store")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @property
+    def REPORTS_DIR(self) -> str:
+        path = os.path.join(self.BASE_DATA_DIR, "reports")
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def validate_keys(self):
         if not self.GOOGLE_API_KEY:

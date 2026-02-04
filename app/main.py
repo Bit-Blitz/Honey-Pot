@@ -27,11 +27,11 @@ async def lifespan(app: FastAPI):
     """
     # Initialize the persistent async checkpointer
     # LangGraph AsyncSqliteSaver.from_conn_string returns a context manager
-    async with AsyncSqliteSaver.from_conn_string("db/checkpoints.sqlite") as saver:
+    async with AsyncSqliteSaver.from_conn_string(settings.CHECKPOINT_DB_PATH) as saver:
         workflow = build_workflow()
         # Compile the graph with the checkpointer
         app.state.graph = workflow.compile(checkpointer=saver)
-        logger.info("🚀 Agentic Graph Compiled with Async Checkpointer")
+        logger.info(f"🚀 Agentic Graph Compiled with Async Checkpointer at {settings.CHECKPOINT_DB_PATH}")
         yield
     # Saver automatically closes here due to context manager
 
@@ -61,9 +61,7 @@ from pythonjsonlogger import jsonlogger
 logger = logging.getLogger(__name__)
 
 # Serve reports directory as static files
-REPORTS_DIR = os.path.join(os.getcwd(), "reports")
-if not os.path.exists(REPORTS_DIR):
-    os.makedirs(REPORTS_DIR)
+REPORTS_DIR = settings.REPORTS_DIR
 app.mount("/reports", StaticFiles(directory=REPORTS_DIR), name="reports")
 
 # Background Task for PDF generation (Solving the Sync Bottleneck)

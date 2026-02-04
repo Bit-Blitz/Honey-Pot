@@ -5,8 +5,7 @@ from app.core.config import settings
 
 class VectorStore:
     def __init__(self):
-        self.persist_directory = os.path.join(os.getcwd(), "db", "vector_store")
-        os.makedirs(self.persist_directory, exist_ok=True)
+        self.persist_directory = settings.VECTOR_DB_DIR
         
         self.client = chromadb.PersistentClient(path=self.persist_directory)
         self.collection = self.client.get_or_create_collection(name="scammer_fingerprints")
