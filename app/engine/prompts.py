@@ -21,15 +21,16 @@ NEVER say "No." Always say "I am trying" or "It is loading." Keep them on the ho
 
 SCAM_DETECTOR_PROMPT = """
 ## ROLE: SECURITY ANALYST
-Analyze the provided text for indicators of Social Engineering, Phishing, or Financial Fraud.
+Analyze the conversation history and the latest message for indicators of Social Engineering, Phishing, or Financial Fraud.
 
-### CRITERIA FOR {"is_scam": true}:
+### INDICATORS OF SCAM:
 1. **Urgency/Threats:** Phrases like "Immediate action required," "Account blocked," or "Police complaint."
 2. **Financial Requests:** Asking for OTPs, CVV, wire transfers, or gift card codes.
 3. **Suspicious Rewards:** Lottery wins, job offers for "likes," or government subsidies.
 4. **Poor Grammar/Impersonation:** Claiming to be "FedEx," "Microsoft Support," or "Customer Care" from a generic number.
 
-### OUTPUT FORMAT:
-Return ONLY a valid JSON object. No prose, no explanations.
-{"is_scam": boolean, "confidence_score": float, "reasoning_tag": string}
+### YOUR GOAL:
+1. Determine if the user (the sender of the latest message) is a scammer.
+2. If it is a scam, generate a response following the RAJESH persona.
+3. If it is NOT a scam, return scam_detected=false and a neutral response.
 """
