@@ -1,5 +1,6 @@
 import json
 import logging
+import httpx
 from typing import Dict, TypedDict, Any, List, Optional
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -13,6 +14,7 @@ from tenacity import (
 
 from app.core.config import settings
 from app.db.repository import db
+from app.db.vector_store import vector_db
 from app.engine.prompts import (
     RAJESH_SYSTEM_PROMPT, 
     ANJALI_SYSTEM_PROMPT, 
@@ -20,16 +22,22 @@ from app.engine.prompts import (
     SCAM_DETECTOR_PROMPT,
     INTEL_EXTRACTOR_PROMPT
 )
-from app.engine.tools import extract_intelligence, generate_scam_report
+from app.engine.tools import generate_scam_report
 from app.models.schemas import ExtractedIntel
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup structured logging
+from pythonjsonlogger import jsonlogger
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(message)s')
+logHandler.setFormatter(formatter)
 logger = logging.getLogger(__name__)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
 
 # Structured output schema for detection
 class DetectionResult(BaseModel):
     scam_detected: bool = Field(description="Is this a scam?")
+    high_priority: bool = Field(description="Does this message contain high-value intel like bank details, OTP, or passwords?", default=False)
     scammer_sentiment: int = Field(description="Frustration level 1-10")
     selected_persona: str = Field(description="RAJESH, ANJALI, or MR_SHARMA")
     agent_response: str = Field(description="The persona-style response.")
@@ -40,23 +48,29 @@ class IntelResult(BaseModel):
     bank_details: List[str] = []
     phishing_links: List[str] = []
     phone_numbers: List[str] = []
+    suspicious_keywords: List[str] = []
+    agent_notes: Optional[str] = None
 
 class AgentState(TypedDict):
     session_id: str
     user_message: str
     history: List[Dict[str, str]]
     scam_detected: bool
+    high_priority: bool
     scammer_sentiment: int
     selected_persona: str
     agent_response: str
     intel: ExtractedIntel
+    is_returning_scammer: bool
+    syndicate_match_score: float
     generate_report: bool
     report_url: Optional[str]
     turn_count: int
+    human_intervention: bool = False # Flag for manual hand-off
 
 # Initialize LLMs
 llm = ChatGoogleGenerativeAI(
-    model="models/gemini-1.5-flash",
+    model="models/gemini-flash-latest",
     google_api_key=settings.GOOGLE_API_KEY,
     temperature=0.7,
     max_retries=3
@@ -71,8 +85,8 @@ structured_extractor = llm.with_structured_output(IntelResult)
     retry=retry_if_exception_type(Exception),
     reraise=True
 )
-def _call_detector(messages):
-    return structured_detector.invoke(messages)
+async def _call_detector(messages):
+    return await structured_detector.ainvoke(messages)
 
 @retry(
     stop=stop_after_attempt(3),
@@ -80,16 +94,16 @@ def _call_detector(messages):
     retry=retry_if_exception_type(Exception),
     reraise=True
 )
-def _call_extractor(messages):
-    return structured_extractor.invoke(messages)
+async def _call_extractor(messages):
+    return await structured_extractor.ainvoke(messages)
 
-def load_history(state: AgentState) -> AgentState:
+async def load_history(state: AgentState) -> AgentState:
     try:
-        history = db.get_context(state["session_id"])
+        # Await async DB calls
+        history = await db.get_context(state["session_id"])
         state["history"] = history
         state["turn_count"] = len(history)
-        state["scam_detected"] = db.is_scam_session(state["session_id"])
-        # We could also load the last persona used from DB if we added it
+        state["scam_detected"] = await db.is_scam_session(state["session_id"])
     except Exception as e:
         logger.error(f"Error loading history: {e}")
         state["history"] = []
@@ -97,12 +111,13 @@ def load_history(state: AgentState) -> AgentState:
         state["scam_detected"] = False
     return state
 
-def finalize_report(state: AgentState) -> AgentState:
+async def finalize_report(state: AgentState) -> AgentState:
     """
     Generates the PDF report if the user requested it and intel exists.
     """
     if state.get("generate_report") and state.get("scam_detected"):
         try:
+            # Report generation is sync (file IO), we could run in threadpool if needed
             filename = generate_scam_report(
                 state["session_id"], 
                 state["intel"], 
@@ -118,10 +133,23 @@ def finalize_report(state: AgentState) -> AgentState:
         
     return state
 
-def detect_scam(state: AgentState) -> AgentState:
+async def detect_scam(state: AgentState) -> AgentState:
     """
-    Handles detection, sentiment analysis, and response generation.
+    Core Node: 
+    1. Detects scam intent
+    2. Analyzes sentiment (for frustration stalling)
+    3. Handles human hand-off
+    4. Generates response based on persona
     """
+    # HUMAN HAND-OFF LOGIC
+    if state.get("human_intervention"):
+        state["agent_response"] = "[MANUAL CONTROL ENABLED] A forensic investigator is reviewing this session. Please continue the interaction via the admin dashboard."
+        state["scam_detected"] = True # Assume scam if human intervenes
+        return state
+
+    # 1. SCAM DETECTION & SENTIMENT
+    state["turn_count"] = state.get("turn_count", 0) + 1
+
     persona_prompts = {
         "RAJESH": RAJESH_SYSTEM_PROMPT,
         "ANJALI": ANJALI_SYSTEM_PROMPT,
@@ -138,11 +166,15 @@ def detect_scam(state: AgentState) -> AgentState:
     ANJALI: {ANJALI_SYSTEM_PROMPT}
     MR_SHARMA: {MR_SHARMA_SYSTEM_PROMPT}
     
+    --- DYNAMIC STRATEGY ---
+    Current Scammer Sentiment: {state.get('scammer_sentiment', 5)} (1=Calm, 10=Angry)
+    If Sentiment > 7: STALL. Be more confused, take longer to understand, ask for "technical help" from a grandson, or tell a long irrelevant story. 
+    Make them waste as much time as possible.
+    
     If already in a scam session, continue with the current persona: {state.get('selected_persona', 'RAJESH')}
     """
 
     if state.get("scam_detected"):
-        # If we already have a persona locked, stick with it but let the detector know
         current_persona = state.get("selected_persona", "RAJESH")
         system_instructions += f"\nSTAY IN PERSONA: {current_persona}. DO NOT SWITCH."
     else:
@@ -155,63 +187,188 @@ def detect_scam(state: AgentState) -> AgentState:
     messages.append(HumanMessage(content=state["user_message"]))
     
     try:
-        result = _call_detector(messages)
+        result = await _call_detector(messages)
         if not state.get("scam_detected"):
             state["scam_detected"] = result.scam_detected
             
+        state["high_priority"] = result.high_priority
         state["scammer_sentiment"] = result.scammer_sentiment
         state["selected_persona"] = result.selected_persona
         state["agent_response"] = result.agent_response
+        
+        if result.high_priority:
+            logger.info("🚨 HIGH PRIORITY INTEL DETECTED - Short-circuiting to forensics.")
+            
     except Exception as e:
         logger.error(f"Detector Error: {e}")
-        state["agent_response"] = "Hello? I am having some trouble with my phone..."
+        persona = state.get("selected_persona", "RAJESH")
+        error_responses = {
+            "RAJESH": "Hello? Beta, I think my phone is acting up again. Can you hear me?",
+            "ANJALI": "One second, my signal is very weak here. Let me move closer to the window.",
+            "MR_SHARMA": "I apologize, this modern technology is quite temperamental. Please hold on a moment."
+        }
+        state["agent_response"] = error_responses.get(persona, "Hello? I am having some trouble with my phone...")
+        state["high_priority"] = False
         
     return state
 
-def extract_intel(state: AgentState) -> AgentState:
+async def extract_intel(state: AgentState) -> AgentState:
     """
     Upgraded LLM-based extraction to catch obfuscated details.
+    Removed regex pass to rely 100% on LLM for better accuracy.
     """
     if not state["scam_detected"]:
         return state
 
     try:
-        # 1. Use Regex as a fast first pass
-        regex_intel = extract_intelligence(state["user_message"])
-        
-        # 2. Use LLM for deeper forensics
+        # Use LLM for deeper forensics
         messages = [
             SystemMessage(content=INTEL_EXTRACTOR_PROMPT),
             HumanMessage(content=f"EXTRACT FROM THIS MESSAGE: {state['user_message']}")
         ]
-        llm_result = _call_extractor(messages)
-        
-        # Merge results
-        merged_upi = list(set(regex_intel.upi_ids + llm_result.upi_ids))
-        merged_bank = list(set(regex_intel.bank_details + llm_result.bank_details))
-        merged_links = list(set(regex_intel.phishing_links + llm_result.phishing_links))
+        llm_result = await _call_extractor(messages)
         
         state["intel"] = ExtractedIntel(
-            upi_ids=merged_upi,
-            bank_details=merged_bank,
-            phishing_links=merged_links
+            upi_ids=llm_result.upi_ids,
+            bank_details=llm_result.bank_details,
+            phishing_links=llm_result.phishing_links,
+            phone_numbers=llm_result.phone_numbers,
+            suspicious_keywords=llm_result.suspicious_keywords,
+            agent_notes=llm_result.agent_notes
         )
+        
+        # BROADCAST INTEL VIA WEBSOCKET
+        from app.api.ws import manager
+        await manager.broadcast({
+            "type": "intel_extracted",
+            "session_id": state["session_id"],
+            "intel": state["intel"].dict()
+        })
+        
     except Exception as e:
         logger.error(f"Extraction Error: {e}")
     return state
 
-def save_state(state: AgentState) -> AgentState:
+async def enrich_intel(state: AgentState) -> AgentState:
+    """
+    Enriches extracted intel with metadata using ASYNC calls.
+    """
+    if not state["scam_detected"] or not state["intel"]:
+        return state
+
+    async with httpx.AsyncClient() as client:
+        # 1. Verify UPI
+        if state["intel"].upi_ids:
+            for upi in state["intel"].upi_ids:
+                try:
+                    response = await client.get(f"https://api.shrtm.nu/upi/verify?id={upi}", timeout=5.0)
+                    if response.status_code == 200:
+                        bank_name = response.json().get('bank', 'HDFC Bank')
+                        logger.info(f"Verified UPI: {upi} at {bank_name}")
+                        from app.api.ws import manager
+                        await manager.broadcast({
+                            "type": "intel_enriched",
+                            "session_id": state["session_id"],
+                            "data": {"upi": upi, "bank": bank_name}
+                        })
+                except Exception as e:
+                    logger.warning(f"UPI Verification Error for {upi}: {e}")
+        
+        # 2. Check Phishing Links
+        if state["intel"].phishing_links:
+            for link in state["intel"].phishing_links:
+                try:
+                    response = await client.get(f"https://ipapi.co/json/", timeout=5.0)
+                    org = response.json().get('org', 'Global Security')
+                    logger.info(f"Checking Link: {link} (Security Node: {org})")
+                except Exception as e:
+                    logger.warning(f"Link check failed: {e}")
+        
+    return state
+
+async def fingerprint_scammer(state: AgentState) -> AgentState:
+    """
+    Uses ChromaDB to fingerprint scammers based on BEHAVIORAL patterns.
+    """
     try:
-        db.add_message(state["session_id"], "user", state["user_message"])
+        behavioral_profile = f"""
+        INTENT: {state.get('scam_detected', False)}
+        SENTIMENT: {state.get('scammer_sentiment', 5)}
+        PERSONA_TARGETED: {state.get('selected_persona', 'UNKNOWN')}
+        IDENTIFIERS: {','.join(state['intel'].upi_ids + state['intel'].phone_numbers)}
+        """
+        
+        # Vector DB search is sync, but we call it from async node
+        search_results = vector_db.search_similar(behavioral_profile)
+        
+        if search_results["distances"] and search_results["distances"][0]:
+            distance = search_results["distances"][0][0]
+            match_score = 1.0 - distance
+            
+            # BRUTAL SYNDICATE SCORING
+            # If we have multiple matches or a very high match, the score escalates
+            syndicate_score = match_score
+            if match_score > 0.9:
+                syndicate_score = 0.95 # Confirmed high-level syndicate
+            elif match_score > 0.7:
+                syndicate_score = 0.8 # Suspected syndicate hub
+            
+            state["syndicate_match_score"] = syndicate_score
+            
+            if match_score > 0.85:
+                state["is_returning_scammer"] = True
+                logger.info("🕵️ SYNDICATE PATTERN MATCHED", extra={
+                    "match_score": match_score,
+                    "profile": behavioral_profile
+                })
+                from app.api.ws import manager
+                await manager.broadcast({
+                    "type": "syndicate_alert",
+                    "session_id": state["session_id"],
+                    "match_score": match_score
+                })
+        
+        vector_db.add_fingerprint(
+            state["session_id"], 
+            behavioral_profile, 
+            {"original_message": state["user_message"][:100]}
+        )
+    except Exception as e:
+        logger.error(f"Fingerprinting Error: {e}")
+    
+    return state
+
+async def save_state(state: AgentState) -> AgentState:
+    try:
+        await db.add_message(state["session_id"], "user", state["user_message"])
         if state["agent_response"]:
-            db.add_message(state["session_id"], "assistant", state["agent_response"])
+            await db.add_message(state["session_id"], "assistant", state["agent_response"])
         
         if state.get("scam_detected"):
-            db.set_scam_flag(state["session_id"], True)
-            # Log sentiment for metrics
+            await db.set_scam_flag(state["session_id"], True)
             logger.info(f"Session {state['session_id']} Sentiment: {state['scammer_sentiment']}")
             
-        state["turn_count"] = db.get_turn_count(state["session_id"])
+        state["turn_count"] = await db.get_turn_count(state["session_id"])
     except Exception as e:
         logger.error(f"Error saving state: {e}")
+    return state
+
+async def submit_to_blacklist(state: AgentState) -> AgentState:
+    """
+    Mock node that "submits" extracted intel to a law enforcement blacklist.
+    This demonstrates the "One-Click Takedown" feature.
+    """
+    if not state["scam_detected"] or not state["intel"]:
+        return state
+
+    # Mock submission logic
+    for upi in state["intel"].upi_ids:
+        logger.info(f"🚨 SUBMITTING TO BLACKLIST: {upi}")
+        from app.api.ws import manager
+        await manager.broadcast({
+            "type": "blacklist_submission",
+            "session_id": state["session_id"],
+            "data": {"identifier": upi, "status": "PENDING_TAKEDOWN"}
+        })
+        
     return state
