@@ -12,6 +12,7 @@ class Metadata(BaseModel):
     locale: Optional[str] = "IN"
 
 class ScammerInput(BaseModel):
+    api_key: Optional[str] = Field(None, alias="apiKey") # Support both api_key and apiKey
     session_id: str = Field(..., validation_alias=AliasChoices("sessionId", "session_id"))
     message: Message
     conversation_history: List[Message] = Field(default=[], validation_alias=AliasChoices("conversationHistory", "conversation_history"))

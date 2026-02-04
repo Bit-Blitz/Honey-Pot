@@ -2,7 +2,8 @@ import logging
 import time
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, Security
+from typing import List, Optional, Dict
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, Security, Query
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -46,11 +47,16 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Authentication scheme - Hackathon uses x-api-key
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
-async def get_api_key(api_key: str = Security(api_key_header)):
-    if api_key == settings.API_KEY:
-        return api_key
+async def get_api_key(
+    header_key: Optional[str] = Security(api_key_header),
+    query_key: Optional[str] = Query(None, alias="api_key")
+):
+    effective_key = header_key or query_key
+    if effective_key == settings.API_KEY:
+        return effective_key
     raise HTTPException(
-        status_code=403, detail="Invalid or Missing API Key"
+        status_code=403, 
+        detail="Invalid or Missing API Key. Use 'x-api-key' header or 'query_key' parameter."
     )
 
 # Include WebSocket and other routers
@@ -85,18 +91,28 @@ async def get_syndicate_graph():
     """
     return await db.get_syndicate_links()
 
-@app.post("/webhook", response_model=AgentResponse, dependencies=[Depends(get_api_key)])
+@app.post("/webhook", response_model=AgentResponse)
 @limiter.limit("5/minute")
 async def chat_webhook(
     request: Request, 
     payload: ScammerInput, 
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    header_api_key: Optional[str] = Security(api_key_header)
 ):
     """
     Main webhook for processing scammer messages.
-    Secured with Rate Limiting.
-    Now fully async to prevent worker blocking.
+    Secured with Rate Limiting and Dual Auth (Header or Body).
     """
+    # 1. Dual-Auth Verification
+    effective_api_key = header_api_key or payload.api_key
+    
+    if effective_api_key != settings.API_KEY:
+        logger.warning(f"Unauthorized access attempt from {request.client.host}")
+        raise HTTPException(
+            status_code=403, 
+            detail="Invalid or Missing API Key (Use 'x-api-key' header or 'apiKey' in JSON body)"
+        )
+
     try:
         # Check if graph is initialized
         if not hasattr(app.state, "graph"):
