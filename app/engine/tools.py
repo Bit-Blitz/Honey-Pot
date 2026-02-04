@@ -4,6 +4,41 @@ from datetime import datetime
 from fpdf import FPDF
 from app.models.schemas import ExtractedIntel
 
+import httpx
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def send_guvi_callback(session_id: str, scam_detected: bool, turn_count: int, intel: ExtractedIntel):
+    """
+    Sends the mandatory final result callback to the GUVI evaluation endpoint.
+    """
+    url = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
+    
+    payload = {
+        "sessionId": session_id,
+        "scamDetected": scam_detected,
+        "totalMessagesExchanged": turn_count,
+        "extractedIntelligence": {
+            "bankAccounts": intel.bank_details,
+            "upiIds": intel.upi_ids,
+            "phishingLinks": intel.phishing_links,
+            "phoneNumbers": intel.phone_numbers,
+            "suspiciousKeywords": intel.suspicious_keywords
+        },
+        "agentNotes": intel.agent_notes or "Scam engagement in progress."
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=10.0)
+            if response.status_code == 200:
+                logger.info(f" Mandatory GUVI callback successful for session {session_id}")
+            else:
+                logger.error(f" GUVI callback failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f" Critical error during GUVI callback: {e}")
+
 def generate_scam_report(session_id: str, intel: ExtractedIntel, persona_name: str) -> str:
     """
     Generates a PDF report for the National Cyber Crime Reporting Portal.
@@ -71,26 +106,3 @@ def generate_scam_report(session_id: str, intel: ExtractedIntel, persona_name: s
     pdf.output(file_path)
     
     return filename
-
-def extract_intelligence(text: str) -> ExtractedIntel:
-    intel = ExtractedIntel()
-    
-    # Normalize text for better extraction (handle some obfuscation)
-    # 1. Remove common separators between digits in what looks like a bank account
-    normalized_text = text.lower()
-    
-    # Regex for UPI IDs
-    upi_pattern = r'[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}'
-    intel.upi_ids = list(set(re.findall(upi_pattern, text)))
-
-    # Regex for URLs
-    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
-    intel.phishing_links = list(set(re.findall(url_pattern, text)))
-
-    # Heuristic for Bank Accounts (9-18 digits)
-    # Try finding digits even with spaces or dashes between them
-    digit_sequences = re.findall(r'(?:\d[\s-]*){9,18}\d', text)
-    cleaned_digits = [re.sub(r'[\s-]', '', d) for d in digit_sequences]
-    intel.bank_details = list(set(cleaned_digits))
-
-    return intel
