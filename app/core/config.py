@@ -8,9 +8,10 @@ load_dotenv()
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Agentic Honey-Pot"
-    # 2. Pydantic will now find this in the loaded environment
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY")
     DATABASE_PATH: str = os.path.join("data", "honey.db")
+    # API Key for webhook authentication
+    API_KEY: str = os.getenv("API_KEY", "honeypot-secret-123")
 
     def validate_keys(self):
         if not self.GOOGLE_API_KEY:
