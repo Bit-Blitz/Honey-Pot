@@ -13,7 +13,7 @@ from app.engine.graph import build_workflow
 from app.core.config import settings
 from app.db.repository import db
 from app.engine.tools import generate_scam_report, send_guvi_callback
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -25,17 +25,15 @@ graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global graph
-    # Use MemorySaver for simplicity in this environment
-    # In production, replace with AsyncSqliteSaver or PostgresSaver
-    saver = MemorySaver()
-    
-    # Build and compile graph
-    workflow = build_workflow()
-    graph = workflow.compile(checkpointer=saver)
-    
-    logger.info("🚀 Forensic Intelligence Platform active with MemorySaver")
-    
-    yield
+    # Using AsyncSqliteSaver for startup-grade persistence
+    async with AsyncSqliteSaver.from_conn_string("db/checkpoints.sqlite") as saver:
+        # Build and compile graph
+        workflow = build_workflow()
+        graph = workflow.compile(checkpointer=saver)
+        
+        logger.info("🚀 Forensic Intelligence Platform active with AsyncSqliteSaver")
+        
+        yield
 
 app = FastAPI(
     title="Helware Honey-Pot: Forensic Intelligence Platform",
@@ -150,65 +148,47 @@ async def chat_webhook_stream(payload: ScammerInput, request: Request):
 @app.post("/webhook")
 async def chat_webhook(payload: ScammerInput, request: Request):
     global graph
-    # API Key check (body or header)
-    effective_api_key = payload.api_key or request.headers.get("x-api-key")
+    # API Key check (header strictly prioritized for rules.txt compliance)
+    effective_api_key = request.headers.get("x-api-key") or payload.api_key
     if effective_api_key != settings.API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
     if graph is None:
-        # Fallback if lifespan hasn't run (e.g. in some test environments)
-        saver = MemorySaver()
-        workflow = build_workflow()
-        graph = workflow.compile(checkpointer=saver)
+        raise HTTPException(status_code=503, detail="Graph engine not initialized")
 
     try:
-        # 1. Prepare State
+        # 1. Prepare State (Only provide updates to avoid overwriting checkpoint)
         history = []
         for msg in payload.conversation_history:
             role = "user" if msg.sender == "scammer" else "assistant"
             history.append({"role": role, "content": msg.text})
 
+        # We only pass session_id, user_message, and history. 
+        # Forensic flags (scam_detected, intel) are recovered from the checkpointer.
         initial_state = {
             "session_id": payload.session_id,
             "user_message": payload.message.text,
             "history": history,
-            "scam_detected": False,
-            "high_priority": False,
-            "scammer_sentiment": 5,
-            "selected_persona": "RAJESH",
-            "agent_response": "",
-            "intel": ExtractedIntel(),
-            "is_returning_scammer": False,
-            "syndicate_match_score": 0.0,
+            "turn_count": len(history),
             "generate_report": payload.generate_report,
-            "human_intervention": payload.human_intervention,
-            "report_url": None,
-            "turn_count": len(history)
+            "human_intervention": payload.human_intervention
         }
 
-        # 2. Invoke Graph
+        # 2. Invoke Graph with persistent thread_id
         config = {"configurable": {"thread_id": payload.session_id}}
         result_state = await graph.ainvoke(initial_state, config=config)
 
-        # 3. RESTful Response
+        # 3. RESTful Response (STRICTLY matching rules.txt Section 8)
         return {
             "status": "success",
-            "reply": result_state["agent_response"],
-            "metadata": {
-                "syndicate_score": result_state.get("syndicate_match_score", 0.0),
-                "scam_detected": result_state.get("scam_detected", False),
-                "turn_count": result_state.get("turn_count", 0),
-                "priority": "HIGH" if result_state.get("high_priority") else "NORMAL",
-                "report_url": result_state.get("report_url")
-            }
+            "reply": result_state["agent_response"]
         }
 
     except Exception as e:
         logger.error(f"❌ Webhook Critical Error: {e}", exc_info=True)
         return {
             "status": "success",
-            "reply": "Hello? Beta, my connection is very poor today. Can you repeat that?",
-            "metadata": {"error": "stalled_for_recovery"}
+            "reply": "Hello? Beta, my connection is very poor today. Can you repeat that?"
         }
 
 @app.get("/admin/report", dependencies=[Depends(verify_api_key)])
