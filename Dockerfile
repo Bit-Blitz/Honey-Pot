@@ -11,4 +11,4 @@ RUN mkdir -p data
 
 EXPOSE 7860
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", "app.main:app"]

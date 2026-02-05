@@ -237,13 +237,9 @@ async def extract_intel(state: AgentState) -> AgentState:
             agent_notes=llm_result.agent_notes
         )
         
-        # BROADCAST INTEL VIA WEBSOCKET
-        from app.api.ws import manager
-        await manager.broadcast({
-            "type": "intel_extracted",
-            "session_id": state["session_id"],
-            "intel": state["intel"].dict()
-        })
+        # BROADCAST INTEL - REMOVED WEBSOCKETS FOR STRICT REST COMPLIANCE
+        # Intel is saved to DB and available via /admin/report or /syndicate/graph
+        pass
         
     except Exception as e:
         logger.error(f"Extraction Error: {e}")
@@ -265,12 +261,6 @@ async def enrich_intel(state: AgentState) -> AgentState:
                     if response.status_code == 200:
                         bank_name = response.json().get('bank', 'HDFC Bank')
                         logger.info(f"Verified UPI: {upi} at {bank_name}")
-                        from app.api.ws import manager
-                        await manager.broadcast({
-                            "type": "intel_enriched",
-                            "session_id": state["session_id"],
-                            "data": {"upi": upi, "bank": bank_name}
-                        })
                 except Exception as e:
                     logger.warning(f"UPI Verification Error for {upi}: {e}")
         
@@ -321,12 +311,6 @@ async def fingerprint_scammer(state: AgentState) -> AgentState:
                     "match_score": match_score,
                     "profile": behavioral_profile
                 })
-                from app.api.ws import manager
-                await manager.broadcast({
-                    "type": "syndicate_alert",
-                    "session_id": state["session_id"],
-                    "match_score": match_score
-                })
         
         vector_db.add_fingerprint(
             state["session_id"], 
@@ -364,11 +348,5 @@ async def submit_to_blacklist(state: AgentState) -> AgentState:
     # Mock submission logic
     for upi in state["intel"].upi_ids:
         logger.info(f"🚨 SUBMITTING TO BLACKLIST: {upi}")
-        from app.api.ws import manager
-        await manager.broadcast({
-            "type": "blacklist_submission",
-            "session_id": state["session_id"],
-            "data": {"identifier": upi, "status": "PENDING_TAKEDOWN"}
-        })
         
     return state
