@@ -5,14 +5,15 @@ from fpdf import FPDF
 from app.models.schemas import ExtractedIntel
 from app.core.config import settings
 
-import httpx
+import requests
 import logging
 
 logger = logging.getLogger(__name__)
 
-async def send_guvi_callback(session_id: str, scam_detected: bool, turn_count: int, intel: ExtractedIntel):
+def send_guvi_callback(session_id: str, scam_detected: bool, turn_count: int, intel: ExtractedIntel):
     """
     Sends the mandatory final result callback to the GUVI evaluation endpoint.
+    Synchronous version for reliable background execution in Flask.
     """
     url = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
     
@@ -31,12 +32,11 @@ async def send_guvi_callback(session_id: str, scam_detected: bool, turn_count: i
     }
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=10.0)
-            if response.status_code == 200:
-                logger.info(f" Mandatory GUVI callback successful for session {session_id}")
-            else:
-                logger.error(f" GUVI callback failed: {response.status_code} - {response.text}")
+        response = requests.post(url, json=payload, timeout=10.0)
+        if response.status_code == 200:
+            logger.info(f" Mandatory GUVI callback successful for session {session_id}")
+        else:
+            logger.error(f" GUVI callback failed: {response.status_code} - {response.text}")
     except Exception as e:
         logger.error(f" Critical error during GUVI callback: {e}")
 

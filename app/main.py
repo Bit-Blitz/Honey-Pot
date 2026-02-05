@@ -1,128 +1,68 @@
 import logging
-import time
-import os
-from contextlib import asynccontextmanager
-from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, Security, Query
-from fastapi.security import APIKeyHeader
-from fastapi.staticfiles import StaticFiles
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import threading
+import asyncio
+from typing import Optional
+from flask import Flask, request, jsonify, send_from_directory, abort
+from flask_cors import CORS
+from langgraph.checkpoint.memory import MemorySaver
 
-from app.models.schemas import ScammerInput, AgentResponse, ExtractedIntel
+from app.models.schemas import ScammerInput, ExtractedIntel
 from app.engine.graph import build_workflow
 from app.core.config import settings
 from app.db.repository import db
 from app.engine.tools import generate_scam_report, send_guvi_callback
-from app.api import ws
 
-# Setup rate limiter
-limiter = Limiter(key_func=get_remote_address)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Manages the lifecycle of the Agentic Graph and its persistent checkpointer.
-    """
-    # Initialize the persistent async checkpointer
-    # LangGraph AsyncSqliteSaver.from_conn_string returns a context manager
-    async with AsyncSqliteSaver.from_conn_string(settings.CHECKPOINT_DB_PATH) as saver:
-        workflow = build_workflow()
-        # Compile the graph with the checkpointer
-        app.state.graph = workflow.compile(checkpointer=saver)
-        logger.info(f"🚀 Agentic Graph Compiled with Async Checkpointer at {settings.CHECKPOINT_DB_PATH}")
-        yield
-    # Saver automatically closes here due to context manager
-
-app = FastAPI(
-    title="Agentic Honey-Pot API", 
-    version="1.0.0",
-    lifespan=lifespan
-)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# Authentication scheme - Hackathon uses x-api-key
-api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
-
-async def get_api_key(
-    header_key: Optional[str] = Security(api_key_header),
-    query_key: Optional[str] = Query(None, alias="api_key")
-):
-    effective_key = header_key or query_key
-    if effective_key == settings.API_KEY:
-        return effective_key
-    raise HTTPException(
-        status_code=403, 
-        detail="Invalid or Missing API Key. Use 'x-api-key' header or 'query_key' parameter."
-    )
-
-# Include WebSocket and other routers
-app.include_router(ws.router)
-
-# Setup logging
-from pythonjsonlogger import jsonlogger
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Serve reports directory as static files
-REPORTS_DIR = settings.REPORTS_DIR
-app.mount("/reports", StaticFiles(directory=REPORTS_DIR), name="reports")
+app = Flask(__name__)
+CORS(app)
 
-# Background Task for PDF generation (Solving the Sync Bottleneck)
-def generate_async_report(session_id: str, intel: ExtractedIntel, persona: str):
-    try:
-        filename = generate_scam_report(session_id, intel, persona)
-        logger.info(f"Background Report Generated: {filename}", extra={"session_id": session_id})
-        # In production, you'd update a DB record or send a webhook here
-    except Exception as e:
-        logger.error(f"Background Report Error: {e}")
+# Global Workflow and MemorySaver
+workflow = build_workflow()
+memory = MemorySaver()
+graph = workflow.compile(checkpointer=memory)
 
-@app.get("/")
+def get_api_key():
+    api_key = request.headers.get("x-api-key") or request.args.get("api_key")
+    if api_key == settings.API_KEY:
+        return api_key
+    abort(403, description="Invalid or Missing API Key. Use 'x-api-key' header or 'api_key' query parameter.")
+
+def background_worker(func, *args):
+    """Simple background task runner for Flask"""
+    thread = threading.Thread(target=func, args=args)
+    thread.start()
+
+@app.route("/", methods=["GET"])
 def health_check():
-    return {"status": "active", "persona_engine": "Multi-Persona (Rajesh, Anjali, Mr. Sharma)"}
+    return jsonify({"status": "active", "persona_engine": "Multi-Persona (Rajesh, Anjali, Mr. Sharma)"})
 
-@app.get("/syndicate/graph", dependencies=[Depends(get_api_key)])
+@app.route("/syndicate/graph", methods=["GET"])
 async def get_syndicate_graph():
-    """
-    Returns a graph representation of linked scam sessions.
-    Used for the Syndicate Intelligence dashboard.
-    """
-    return await db.get_syndicate_links()
+    get_api_key()
+    links = await db.get_syndicate_links()
+    return jsonify(links)
 
-@app.post("/webhook", response_model=AgentResponse)
-@limiter.limit("5/minute")
-async def chat_webhook(
-    request: Request, 
-    payload: ScammerInput, 
-    background_tasks: BackgroundTasks,
-    header_api_key: Optional[str] = Security(api_key_header)
-):
-    """
-    Main webhook for processing scammer messages.
-    Secured with Rate Limiting and Dual Auth (Header or Body).
-    """
-    # 1. Dual-Auth Verification
-    effective_api_key = header_api_key or payload.api_key
+@app.route("/webhook", methods=["POST"])
+async def chat_webhook():
+    # 1. Auth & Validation
+    data = request.get_json()
+    if not data:
+        abort(400, description="Missing JSON body")
     
+    try:
+        payload = ScammerInput(**data)
+    except Exception as e:
+        abort(400, description=f"Invalid payload: {e}")
+
+    effective_api_key = payload.api_key or request.headers.get("x-api-key")
     if effective_api_key != settings.API_KEY:
-        logger.warning(f"Unauthorized access attempt from {request.client.host}")
-        raise HTTPException(
-            status_code=403, 
-            detail="Invalid or Missing API Key (Use 'x-api-key' header or 'apiKey' in JSON body)"
-        )
+        abort(403, description="Invalid or Missing API Key")
 
     try:
-        # Check if graph is initialized
-        if not hasattr(app.state, "graph"):
-             logger.error("Agentic Graph not initialized in lifespan. Check startup logs.")
-             # For tests where lifespan might not run correctly, we attempt to initialize it without saver
-             # but this is not recommended for production
-             workflow = build_workflow()
-             app.state.graph = workflow.compile()
-
-        # Convert incoming conversation history to AgentState format
+        # 2. Process Message
         history = []
         for msg in payload.conversation_history:
             role = "user" if msg.sender == "scammer" else "assistant"
@@ -146,23 +86,21 @@ async def chat_webhook(
             "turn_count": len(history)
         }
 
-        # Invoke Graph with Checkpointing (thread_id) - ASYNC
+        # 3. Invoke Graph - Use MemorySaver for internal state
+        # Persistence is handled separately by HoneyDB in the nodes
         config = {"configurable": {"thread_id": payload.session_id}}
-        result_state = await request.app.state.graph.ainvoke(initial_state, config=config)
+        result_state = await graph.ainvoke(initial_state, config=config)
 
-        # Trigger Background Report if requested
+        # 4. Background Tasks
         if payload.generate_report and result_state.get("scam_detected"):
-            background_tasks.add_task(
-                generate_async_report, 
+            threading.Thread(target=generate_scam_report, args=(
                 result_state["session_id"], 
                 result_state["intel"], 
                 result_state.get("selected_persona", "RAJESH")
-            )
+            )).start()
 
-        # MANDATORY GUVI CALLBACK
-        # Trigger if scam detected and we have some engagement (turn_count > 0)
         if result_state.get("scam_detected"):
-            background_tasks.add_task(
+            background_worker(
                 send_guvi_callback,
                 result_state["session_id"],
                 True,
@@ -170,46 +108,30 @@ async def chat_webhook(
                 result_state["intel"]
             )
 
-        # Syndicate Alert (Honeypot Callback)
-        if result_state.get("is_returning_scammer"):
-            await ws.manager.broadcast({
-                "type": "syndicate_alert",
-                "session_id": result_state["session_id"],
-                "match_score": result_state.get("syndicate_match_score")
-            })
-
-        # Hackathon mandated response format with extra intelligence metadata
-        return AgentResponse(
-            status="success",
-            reply=result_state["agent_response"],
-            metadata={
+        # 5. RESTful Response
+        return jsonify({
+            "status": "success",
+            "reply": result_state["agent_response"],
+            "metadata": {
                 "syndicate_score": result_state.get("syndicate_match_score", 0.0),
                 "scam_detected": result_state.get("scam_detected", False),
                 "turn_count": result_state.get("turn_count", 0)
             }
-        )
+        })
 
-    except HTTPException as e:
-        raise e
     except Exception as e:
         logger.error(f"❌ Webhook Critical Error: {e}", exc_info=True)
-        # Return a structured error response instead of just 500
-        return AgentResponse(
-            status="error",
-            reply="I am experiencing a momentary connection issue. Please bear with me."
-        )
+        abort(500, description="I am experiencing a momentary connection issue.")
 
-@app.get("/admin/report", dependencies=[Depends(get_api_key)])
+@app.route("/admin/report", methods=["GET"])
 async def get_summary_report():
-    """
-    Law Enforcement / Admin View: Summary of all detected scams.
-    """
+    get_api_key()
     stats = await db.get_stats()
-    return {
-        **stats,
-        "status": "Ready for Law Enforcement Export"
-    }
+    return jsonify({**stats, "status": "Ready for Law Enforcement Export"})
+
+@app.route("/reports/<path:filename>")
+def serve_report(filename):
+    return send_from_directory(settings.REPORTS_DIR, filename)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    app.run(host="0.0.0.0", port=7860)
