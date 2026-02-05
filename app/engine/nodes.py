@@ -233,7 +233,7 @@ async def detect_scam(state: AgentState) -> AgentState:
 async def extract_intel(state: AgentState) -> AgentState:
     """
     Upgraded LLM-based extraction to catch obfuscated details.
-    Removed regex pass to rely 100% on LLM for better accuracy.
+    Merges with existing intelligence to maintain cumulative state.
     """
     if not state["scam_detected"]:
         return state
@@ -246,14 +246,23 @@ async def extract_intel(state: AgentState) -> AgentState:
         ]
         llm_result = await _call_extractor(messages)
         
-        state["intel"] = ExtractedIntel(
-            upi_ids=llm_result.upi_ids,
-            bank_details=llm_result.bank_details,
-            phishing_links=llm_result.phishing_links,
-            phone_numbers=llm_result.phone_numbers,
-            suspicious_keywords=llm_result.suspicious_keywords,
-            agent_notes=llm_result.agent_notes
+        # Merge logic to ensure cumulative intelligence (MANDATORY for high score)
+        current_intel = state.get("intel", ExtractedIntel())
+        
+        # Helper to merge unique items
+        def merge_unique(old_list, new_list):
+            return list(set((old_list or []) + (new_list or [])))
+
+        merged_intel = ExtractedIntel(
+            upi_ids=merge_unique(current_intel.upi_ids, llm_result.upi_ids),
+            bank_details=merge_unique(current_intel.bank_details, llm_result.bank_details),
+            phishing_links=merge_unique(current_intel.phishing_links, llm_result.phishing_links),
+            phone_numbers=merge_unique(current_intel.phone_numbers, llm_result.phone_numbers),
+            suspicious_keywords=merge_unique(current_intel.suspicious_keywords, llm_result.suspicious_keywords),
+            agent_notes=llm_result.agent_notes or current_intel.agent_notes
         )
+        
+        state["intel"] = merged_intel
         
         # Save to DB for syndicate analysis (MANDATORY FOR GRAPH)
         for upi in llm_result.upi_ids:
@@ -264,9 +273,6 @@ async def extract_intel(state: AgentState) -> AgentState:
             await db.save_intel(state["session_id"], "link", link)
         for phone in llm_result.phone_numbers:
             await db.save_intel(state["session_id"], "phone", phone)
-        
-        # BROADCAST INTEL - REMOVED WEBSOCKETS FOR STRICT REST COMPLIANCE
-        pass
         
     except Exception as e:
         logger.error(f"Extraction Error: {e}")
@@ -396,19 +402,20 @@ async def guvi_reporting(state: AgentState) -> AgentState:
     """
     Mandatory GUVI Final Result Callback. 
     This is hard-linked into the graph to ensure every session is scored.
+    Strictly follows rules.txt requirements.
     """
     from app.engine.tools import send_guvi_callback
     
-    # We only report if a scam was detected or if we have significant interaction
-    if state.get("scam_detected") or state.get("turn_count", 0) > 3:
+    # Report as soon as scam is detected to ensure we are scored.
+    # The platform will track 'totalMessagesExchanged' to measure depth.
+    if state.get("scam_detected"):
         try:
-            logger.info(f"📊 HARD-LINKED CALLBACK: Sending session {state['session_id']} to GUVI evaluation...")
-            # send_guvi_callback is async in tools.py
+            logger.info(f"📊 MANDATORY CALLBACK: reporting session {state['session_id']} (Total turns: {state.get('turn_count')})")
             await send_guvi_callback(
                 state["session_id"],
-                state.get("scam_detected", False),
-                state.get("turn_count", 1),
-                state["intel"]
+                True, # scamDetected = true
+                state.get("turn_count", 1), # totalMessagesExchanged
+                state["intel"] # extractedIntelligence
             )
         except Exception as e:
             logger.error(f"❌ GUVI Reporting Failed: {e}")

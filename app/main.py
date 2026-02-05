@@ -13,7 +13,7 @@ from app.engine.graph import build_workflow
 from app.core.config import settings
 from app.db.repository import db
 from app.engine.tools import generate_scam_report, send_guvi_callback
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -25,17 +25,15 @@ graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global graph
-    # Use MemorySaver for simplicity in this environment
-    # In production, replace with AsyncSqliteSaver or PostgresSaver
-    saver = MemorySaver()
-    
-    # Build and compile graph
-    workflow = build_workflow()
-    graph = workflow.compile(checkpointer=saver)
-    
-    logger.info("🚀 Forensic Intelligence Platform active with MemorySaver")
-    
-    yield
+    # Using AsyncSqliteSaver for startup-grade persistence
+    async with AsyncSqliteSaver.from_conn_string("db/checkpoints.sqlite") as saver:
+        # Build and compile graph
+        workflow = build_workflow()
+        graph = workflow.compile(checkpointer=saver)
+        
+        logger.info("🚀 Forensic Intelligence Platform active with AsyncSqliteSaver")
+        
+        yield
 
 app = FastAPI(
     title="Helware Honey-Pot: Forensic Intelligence Platform",
@@ -156,10 +154,7 @@ async def chat_webhook(payload: ScammerInput, request: Request):
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
     if graph is None:
-        # Fallback if lifespan hasn't run (e.g. in some test environments)
-        saver = MemorySaver()
-        workflow = build_workflow()
-        graph = workflow.compile(checkpointer=saver)
+        raise HTTPException(status_code=503, detail="Graph engine not initialized")
 
     try:
         # 1. Prepare State
@@ -190,17 +185,10 @@ async def chat_webhook(payload: ScammerInput, request: Request):
         config = {"configurable": {"thread_id": payload.session_id}}
         result_state = await graph.ainvoke(initial_state, config=config)
 
-        # 3. RESTful Response
+        # 3. RESTful Response (Strictly matching rules.txt expectations)
         return {
             "status": "success",
-            "reply": result_state["agent_response"],
-            "metadata": {
-                "syndicate_score": result_state.get("syndicate_match_score", 0.0),
-                "scam_detected": result_state.get("scam_detected", False),
-                "turn_count": result_state.get("turn_count", 0),
-                "priority": "HIGH" if result_state.get("high_priority") else "NORMAL",
-                "report_url": result_state.get("report_url")
-            }
+            "reply": result_state["agent_response"]
         }
 
     except Exception as e:
