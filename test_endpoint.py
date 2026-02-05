@@ -1,20 +1,21 @@
-import requests
 import uuid
 import json
-import time
+import asyncio
+import httpx
 from app.main import app
 
-def run_tests():
-    print("🚀 Running Startup-Grade REST API Verification (Flask)...")
+async def run_tests():
+    print("🚀 Running Startup-Grade REST API Verification (FastAPI)...")
     
     # API KEY for authentication
     API_KEY = "helware-secret-key-2024"
     HEADERS = {"x-api-key": API_KEY}
 
-    with app.test_client() as client:
+    # Use httpx with ASGITransport for modern testing
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         # 1. Health Check
         try:
-            response = client.get("/")
+            response = await client.get("/")
             assert response.status_code == 200
             print("✅ Health Check Passed")
         except Exception as e:
@@ -22,7 +23,7 @@ def run_tests():
 
         # 2. Admin Report
         try:
-            response = client.get("/admin/report", headers=HEADERS)
+            response = await client.get("/admin/report", headers=HEADERS)
             assert response.status_code == 200
             print("✅ Admin Auth & Persistence Passed")
         except Exception as e:
@@ -30,42 +31,72 @@ def run_tests():
 
         # 2.1 Syndicate Graph
         try:
-            response = client.get("/syndicate/graph", headers=HEADERS)
+            response = await client.get("/syndicate/graph", headers=HEADERS)
             assert response.status_code == 200
-            data = response.get_json()
+            data = response.json()
             assert "nodes" in data
             print("✅ Syndicate Graph API Passed")
         except Exception as e:
             print(f"❌ Syndicate Graph Failed: {e}")
 
-        # 3. Webhook (Agentic Loop)
+        # 3. Webhook (Agentic Loop - First Message)
         try:
             session_id = f"test_{uuid.uuid4().hex[:8]}"
             payload = {
                 "sessionId": session_id,
                 "message": {
                     "sender": "scammer",
-                    "text": "Hello, I am calling from your bank. Please share your UPI ID to verify your account.",
+                    "text": "Your bank account will be blocked today. Verify immediately.",
                     "timestamp": 1770005528731
                 },
                 "conversationHistory": [],
-                "apiKey": API_KEY, # Test body auth too
-                "metadata": {
-                    "channel": "SMS",
-                    "language": "English",
-                    "locale": "IN"
-                }
+                "apiKey": API_KEY,
+                "generate_report": True
             }
             
-            print(f"   📤 Sending Scammer Message: {payload['message']['text']}")
-            response = client.post("/webhook", json=payload)
+            print(f"   📤 Sending First Message: {payload['message']['text']}")
+            response = await client.post("/webhook", json=payload, headers=HEADERS)
             
             if response.status_code != 200:
-                print(f"❌ Webhook failed with status {response.status_code}: {response.get_data(as_text=True)}")
+                print(f"❌ Webhook failed with status {response.status_code}: {response.text}")
             else:
-                data = response.get_json()
+                data = response.json()
                 assert data["status"] == "success"
-                print("✅ End-to-End Agentic Loop Passed")
+                print("✅ First Message Loop Passed")
+                print(f"   🤖 Agent Reply: {data['reply']}")
+
+            # 4. Webhook (Follow-up Message)
+            follow_up_payload = {
+                "sessionId": session_id,
+                "message": {
+                    "sender": "scammer",
+                    "text": "Share your UPI ID to avoid account suspension.",
+                    "timestamp": 1770005528731
+                },
+                "conversationHistory": [
+                    {
+                        "sender": "scammer",
+                        "text": "Your bank account will be blocked today. Verify immediately.",
+                        "timestamp": 1770005528731
+                    },
+                    {
+                        "sender": "user",
+                        "text": data["reply"],
+                        "timestamp": 1770005528731
+                    }
+                ],
+                "apiKey": API_KEY
+            }
+
+            print(f"   📤 Sending Follow-up Message: {follow_up_payload['message']['text']}")
+            response = await client.post("/webhook", json=follow_up_payload, headers=HEADERS)
+            
+            if response.status_code != 200:
+                print(f"❌ Follow-up Webhook failed: {response.text}")
+            else:
+                data = response.json()
+                assert data["status"] == "success"
+                print("✅ Follow-up Message Loop Passed")
                 print(f"   🤖 Agent Reply: {data['reply']}")
                 
                 if "metadata" in data:
@@ -77,4 +108,4 @@ def run_tests():
     print("\n🎉 PROJECT STATUS: EVALUATION READY")
 
 if __name__ == "__main__":
-    run_tests()
+    asyncio.run(run_tests())
