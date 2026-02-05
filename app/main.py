@@ -148,8 +148,8 @@ async def chat_webhook_stream(payload: ScammerInput, request: Request):
 @app.post("/webhook")
 async def chat_webhook(payload: ScammerInput, request: Request):
     global graph
-    # API Key check (body or header)
-    effective_api_key = payload.api_key or request.headers.get("x-api-key")
+    # API Key check (header strictly prioritized for rules.txt compliance)
+    effective_api_key = request.headers.get("x-api-key") or payload.api_key
     if effective_api_key != settings.API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
@@ -157,35 +157,28 @@ async def chat_webhook(payload: ScammerInput, request: Request):
         raise HTTPException(status_code=503, detail="Graph engine not initialized")
 
     try:
-        # 1. Prepare State
+        # 1. Prepare State (Only provide updates to avoid overwriting checkpoint)
         history = []
         for msg in payload.conversation_history:
             role = "user" if msg.sender == "scammer" else "assistant"
             history.append({"role": role, "content": msg.text})
 
+        # We only pass session_id, user_message, and history. 
+        # Forensic flags (scam_detected, intel) are recovered from the checkpointer.
         initial_state = {
             "session_id": payload.session_id,
             "user_message": payload.message.text,
             "history": history,
-            "scam_detected": False,
-            "high_priority": False,
-            "scammer_sentiment": 5,
-            "selected_persona": "RAJESH",
-            "agent_response": "",
-            "intel": ExtractedIntel(),
-            "is_returning_scammer": False,
-            "syndicate_match_score": 0.0,
+            "turn_count": len(history),
             "generate_report": payload.generate_report,
-            "human_intervention": payload.human_intervention,
-            "report_url": None,
-            "turn_count": len(history)
+            "human_intervention": payload.human_intervention
         }
 
-        # 2. Invoke Graph
+        # 2. Invoke Graph with persistent thread_id
         config = {"configurable": {"thread_id": payload.session_id}}
         result_state = await graph.ainvoke(initial_state, config=config)
 
-        # 3. RESTful Response (Strictly matching rules.txt expectations)
+        # 3. RESTful Response (STRICTLY matching rules.txt Section 8)
         return {
             "status": "success",
             "reply": result_state["agent_response"]
@@ -195,8 +188,7 @@ async def chat_webhook(payload: ScammerInput, request: Request):
         logger.error(f"❌ Webhook Critical Error: {e}", exc_info=True)
         return {
             "status": "success",
-            "reply": "Hello? Beta, my connection is very poor today. Can you repeat that?",
-            "metadata": {"error": "stalled_for_recovery"}
+            "reply": "Hello? Beta, my connection is very poor today. Can you repeat that?"
         }
 
 @app.get("/admin/report", dependencies=[Depends(verify_api_key)])

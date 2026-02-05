@@ -280,32 +280,33 @@ async def extract_intel(state: AgentState) -> AgentState:
 
 async def enrich_intel(state: AgentState) -> AgentState:
     """
-    Enriches extracted intel with metadata using ASYNC calls.
+    Enriches extracted intel with metadata using ASYNC calls in parallel.
     """
     if not state["scam_detected"] or not state["intel"]:
         return state
 
+    intel = state["intel"]
+    tasks = []
+
     async with httpx.AsyncClient() as client:
-        # 1. Verify UPI
-        if state["intel"].upi_ids:
-            for upi in state["intel"].upi_ids:
-                try:
-                    response = await client.get(f"https://api.shrtm.nu/upi/verify?id={upi}", timeout=5.0)
-                    if response.status_code == 200:
-                        bank_name = response.json().get('bank', 'HDFC Bank')
-                        logger.info(f"Verified UPI: {upi} at {bank_name}")
-                except Exception as e:
-                    logger.warning(f"UPI Verification Error for {upi}: {e}")
+        # 1. Verify UPIs in parallel
+        if intel.upi_ids:
+            for upi in intel.upi_ids:
+                tasks.append(client.get(f"https://api.shrtm.nu/upi/verify?id={upi}", timeout=3.0))
         
-        # 2. Check Phishing Links
-        if state["intel"].phishing_links:
-            for link in state["intel"].phishing_links:
-                try:
-                    response = await client.get(f"https://ipapi.co/json/", timeout=5.0)
-                    org = response.json().get('org', 'Global Security')
-                    logger.info(f"Checking Link: {link} (Security Node: {org})")
-                except Exception as e:
-                    logger.warning(f"Link check failed: {e}")
+        # 2. Check Phishing Links in parallel
+        if intel.phishing_links:
+            for link in intel.phishing_links:
+                tasks.append(client.get(f"https://ipapi.co/json/", timeout=3.0))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, httpx.Response):
+                    if res.status_code == 200:
+                        logger.info(f"Enrichment success: {res.url}")
+                elif isinstance(res, Exception):
+                    logger.warning(f"Enrichment task failed: {res}")
         
     return state
 
@@ -372,7 +373,7 @@ async def save_state(state: AgentState) -> AgentState:
 
 async def submit_to_blacklist(state: AgentState) -> AgentState:
     """
-    Simulates a 'One-Click Takedown' by verifying and reporting malicious intel.
+    Simulates a 'One-Click Takedown' by verifying and reporting malicious intel in parallel.
     Instead of just logging, it simulates a real security API interaction.
     """
     if not state["scam_detected"] or not state["intel"]:
@@ -385,16 +386,20 @@ async def submit_to_blacklist(state: AgentState) -> AgentState:
     if intel.phishing_links: targets.extend([("URL", l) for l in intel.phishing_links])
     if intel.phone_numbers: targets.extend([("PHONE", p) for p in intel.phone_numbers])
 
+    if not targets:
+        return state
+
     async with httpx.AsyncClient() as client:
-        for type, val in targets:
-            try:
-                # Simulating a call to a Threat Intel API (e.g., VirusTotal/AbuseIPDB)
-                logger.info(f"🛡️ ANALYZING THREAT: {type} - {val}")
-                # Mock a real security check delay
-                await client.post("https://httpbin.org/post", json={"threat": val, "type": type}, timeout=5.0)
-                logger.info(f"✅ TAKEDOWN REQUESTED: {type} {val} submitted to National Cyber Crime Reporting Portal (NCCRP)")
-            except Exception as e:
-                logger.warning(f"Takedown Simulation Error: {e}")
+        tasks = [
+            client.post("https://httpbin.org/post", json={"threat": val, "type": t}, timeout=3.0)
+            for t, val in targets
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, httpx.Response):
+                logger.info(f"🛡️ Takedown request successful for {res.url}")
+            elif isinstance(res, Exception):
+                logger.warning(f"🛡️ Takedown request failed: {res}")
         
     return state
 
@@ -415,7 +420,7 @@ async def guvi_reporting(state: AgentState) -> AgentState:
                 state["session_id"],
                 True, # scamDetected = true
                 state.get("turn_count", 1), # totalMessagesExchanged
-                state["intel"] # extractedIntelligence
+                state.get("intel", ExtractedIntel()) # extractedIntelligence
             )
         except Exception as e:
             logger.error(f"❌ GUVI Reporting Failed: {e}")
