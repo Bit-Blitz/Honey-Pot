@@ -1,68 +1,168 @@
 import logging
-import threading
 import asyncio
-from typing import Optional
-from flask import Flask, request, jsonify, send_from_directory, abort
-from flask_cors import CORS
-from langgraph.checkpoint.memory import MemorySaver
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+import json
 
 from app.models.schemas import ScammerInput, ExtractedIntel
 from app.engine.graph import build_workflow
 from app.core.config import settings
 from app.db.repository import db
 from app.engine.tools import generate_scam_report, send_guvi_callback
+from langgraph.checkpoint.memory import MemorySaver
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)
+# Global state for the graph
+graph = None
 
-# Global Workflow and MemorySaver
-workflow = build_workflow()
-memory = MemorySaver()
-graph = workflow.compile(checkpointer=memory)
-
-def get_api_key():
-    api_key = request.headers.get("x-api-key") or request.args.get("api_key")
-    if api_key == settings.API_KEY:
-        return api_key
-    abort(403, description="Invalid or Missing API Key. Use 'x-api-key' header or 'api_key' query parameter.")
-
-def background_worker(func, *args):
-    """Simple background task runner for Flask"""
-    thread = threading.Thread(target=func, args=args)
-    thread.start()
-
-@app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({"status": "active", "persona_engine": "Multi-Persona (Rajesh, Anjali, Mr. Sharma)"})
-
-@app.route("/syndicate/graph", methods=["GET"])
-async def get_syndicate_graph():
-    get_api_key()
-    links = await db.get_syndicate_links()
-    return jsonify(links)
-
-@app.route("/webhook", methods=["POST"])
-async def chat_webhook():
-    # 1. Auth & Validation
-    data = request.get_json()
-    if not data:
-        abort(400, description="Missing JSON body")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global graph
+    # Use MemorySaver for simplicity in this environment
+    # In production, replace with AsyncSqliteSaver or PostgresSaver
+    saver = MemorySaver()
     
-    try:
-        payload = ScammerInput(**data)
-    except Exception as e:
-        abort(400, description=f"Invalid payload: {e}")
+    # Build and compile graph
+    workflow = build_workflow()
+    graph = workflow.compile(checkpointer=saver)
+    
+    logger.info("🚀 Forensic Intelligence Platform active with MemorySaver")
+    
+    yield
 
+app = FastAPI(
+    title="Helware Honey-Pot: Forensic Intelligence Platform",
+    description="Advanced scam syndicate detection and evidence gathering engine.",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def verify_api_key(request: Request):
+    api_key = request.headers.get("x-api-key") or request.query_params.get("api_key")
+    if api_key != settings.API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or Missing API Key")
+    return api_key
+
+@app.get("/")
+async def health_check():
+    return {
+        "status": "operational",
+        "engine": "Forensic Intelligence Platform v2.0",
+        "active_personas": ["RAJESH", "ANJALI", "MR_SHARMA"]
+    }
+
+@app.get("/syndicate/graph", dependencies=[Depends(verify_api_key)])
+async def get_syndicate_graph():
+    return await db.get_syndicate_links()
+
+@app.get("/admin/forensics", dependencies=[Depends(verify_api_key)])
+async def get_all_forensics():
+    """Returns all extracted intelligence across all sessions for the dashboard."""
+    return await db.get_all_intel()
+
+@app.post("/admin/intervention/{session_id}", dependencies=[Depends(verify_api_key)])
+async def toggle_intervention(session_id: str, enabled: bool = True, manual_response: str = None):
+    """
+    The 'Panic Button': Allows a judge/admin to take over the session.
+    - enabled: True to freeze AI and enable manual control.
+    - manual_response: The specific message to send to the scammer.
+    """
+    await db.set_human_intervention(session_id, enabled, manual_response)
+    return {
+        "status": "success", 
+        "session_id": session_id, 
+        "human_intervention": enabled,
+        "manual_response_queued": manual_response is not None
+    }
+
+@app.post("/webhook/stream")
+async def chat_webhook_stream(payload: ScammerInput, request: Request):
+    """Streaming version of the webhook for better UX"""
     effective_api_key = payload.api_key or request.headers.get("x-api-key")
     if effective_api_key != settings.API_KEY:
-        abort(403, description="Invalid or Missing API Key")
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized")
+
+    async def event_generator():
+        try:
+            history = []
+            for msg in payload.conversation_history:
+                role = "user" if msg.sender == "scammer" else "assistant"
+                history.append({"role": role, "content": msg.text})
+
+            initial_state = {
+                "session_id": payload.session_id,
+                "user_message": payload.message.text,
+                "history": history,
+                "scam_detected": False,
+                "high_priority": False,
+                "scammer_sentiment": 5,
+                "selected_persona": "RAJESH",
+                "agent_response": "",
+                "intel": ExtractedIntel(),
+                "is_returning_scammer": False,
+                "syndicate_match_score": 0.0,
+                "generate_report": payload.generate_report,
+                "human_intervention": payload.human_intervention,
+                "report_url": None,
+                "turn_count": len(history)
+            }
+
+            config = {"configurable": {"thread_id": payload.session_id}}
+            
+            async for chunk in graph.astream(initial_state, config=config, stream_mode="updates"):
+                for node_name, node_state in chunk.items():
+                    yield f"data: {json.dumps({'node': node_name, 'status': 'processing'})}\n\n"
+                    
+                    if node_name == "process_interaction" and node_state.get("agent_response"):
+                        final_data = {
+                            "status": "success",
+                            "reply": node_state["agent_response"],
+                            "metadata": {
+                                "scam_detected": node_state.get("scam_detected", False),
+                                "priority": "HIGH" if node_state.get("high_priority") else "NORMAL"
+                            }
+                        }
+                        yield f"data: {json.dumps(final_data)}\n\n"
+
+        except Exception as e:
+            logger.error(f"Streaming Error: {e}")
+            yield f"data: {json.dumps({'error': 'stalled_for_recovery', 'reply': 'Hello? Beta...'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/webhook")
+async def chat_webhook(payload: ScammerInput, request: Request):
+    global graph
+    # API Key check (body or header)
+    effective_api_key = payload.api_key or request.headers.get("x-api-key")
+    if effective_api_key != settings.API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+
+    if graph is None:
+        # Fallback if lifespan hasn't run (e.g. in some test environments)
+        saver = MemorySaver()
+        workflow = build_workflow()
+        graph = workflow.compile(checkpointer=saver)
 
     try:
-        # 2. Process Message
+        # 1. Prepare State
         history = []
         for msg in payload.conversation_history:
             role = "user" if msg.sender == "scammer" else "assistant"
@@ -86,52 +186,43 @@ async def chat_webhook():
             "turn_count": len(history)
         }
 
-        # 3. Invoke Graph - Use MemorySaver for internal state
-        # Persistence is handled separately by HoneyDB in the nodes
+        # 2. Invoke Graph
         config = {"configurable": {"thread_id": payload.session_id}}
         result_state = await graph.ainvoke(initial_state, config=config)
 
-        # 4. Background Tasks
-        if payload.generate_report and result_state.get("scam_detected"):
-            threading.Thread(target=generate_scam_report, args=(
-                result_state["session_id"], 
-                result_state["intel"], 
-                result_state.get("selected_persona", "RAJESH")
-            )).start()
-
-        if result_state.get("scam_detected"):
-            background_worker(
-                send_guvi_callback,
-                result_state["session_id"],
-                True,
-                result_state.get("turn_count", 1),
-                result_state["intel"]
-            )
-
-        # 5. RESTful Response
-        return jsonify({
+        # 3. RESTful Response
+        return {
             "status": "success",
             "reply": result_state["agent_response"],
             "metadata": {
                 "syndicate_score": result_state.get("syndicate_match_score", 0.0),
                 "scam_detected": result_state.get("scam_detected", False),
-                "turn_count": result_state.get("turn_count", 0)
+                "turn_count": result_state.get("turn_count", 0),
+                "priority": "HIGH" if result_state.get("high_priority") else "NORMAL",
+                "report_url": result_state.get("report_url")
             }
-        })
+        }
 
     except Exception as e:
         logger.error(f"❌ Webhook Critical Error: {e}", exc_info=True)
-        abort(500, description="I am experiencing a momentary connection issue.")
+        return {
+            "status": "success",
+            "reply": "Hello? Beta, my connection is very poor today. Can you repeat that?",
+            "metadata": {"error": "stalled_for_recovery"}
+        }
 
-@app.route("/admin/report", methods=["GET"])
+@app.get("/admin/report", dependencies=[Depends(verify_api_key)])
 async def get_summary_report():
-    get_api_key()
     stats = await db.get_stats()
-    return jsonify({**stats, "status": "Ready for Law Enforcement Export"})
+    return {**stats, "status": "Ready for Law Enforcement Export"}
 
-@app.route("/reports/<path:filename>")
-def serve_report(filename):
-    return send_from_directory(settings.REPORTS_DIR, filename)
+@app.get("/reports/{filename}")
+async def serve_report(filename: str):
+    file_path = os.path.join(settings.REPORTS_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Report not found")
+    return FileResponse(file_path)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7860)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
